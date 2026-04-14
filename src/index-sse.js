@@ -25,6 +25,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createServer } from "http";
 import * as dotenv from "dotenv";
 import { fileURLToPath } from "url";
@@ -62,6 +63,33 @@ function extractCreds(req, url) {
     email:      q.get("email")       || h["x-clickmassa-email"]       || DEFAULT_EMAIL,
     password:   q.get("password")    || h["x-clickmassa-password"]    || DEFAULT_PASSWORD,
     superApiUrl: q.get("super_api_url") || h["x-clickmassa-super-api-url"] || DEFAULT_SUPER_API || undefined,
+  };
+}
+
+// Extrai credenciais de headers HTTP padrão (usado pelo endpoint /mcp)
+// GapHub envia: Authorization: Bearer TOKEN, X-CRM-Api-Url: URL
+function extractCredsFromHeaders(req) {
+  const h = req.headers;
+
+  // Token: Authorization: Bearer TOKEN  ou  x-clickmassa-token
+  let token = DEFAULT_TOKEN;
+  const auth = h["authorization"] || "";
+  if (auth.startsWith("Bearer ")) token = auth.slice(7).trim() || DEFAULT_TOKEN;
+  token = token || h["x-clickmassa-token"] || DEFAULT_TOKEN;
+
+  // Base URL da API CRM
+  const baseUrl = h["x-crm-api-url"] || h["x-clickmassa-base-url"] || DEFAULT_BASE_URL;
+
+  // Canal ID — GapHub envia como x-crm-waba-id ou x-clickmassa-canal-id
+  const canalId = h["x-crm-waba-id"] || h["x-clickmassa-canal-id"] || DEFAULT_CANAL_ID;
+
+  return {
+    baseUrl,
+    token,
+    canalId,
+    email:      h["x-clickmassa-email"]       || DEFAULT_EMAIL,
+    password:   h["x-clickmassa-password"]    || DEFAULT_PASSWORD,
+    superApiUrl: h["x-clickmassa-super-api-url"] || DEFAULT_SUPER_API || undefined,
   };
 }
 
@@ -207,6 +235,47 @@ const httpServer = createServer(async (req, res) => {
       ],
       totalTools: 49,
     }));
+    return;
+  }
+
+  // ── POST /mcp — HTTP Streamable Transport (protocolo MCP moderno) ───────────
+  // Usado pelo GapHub e clientes JSON-RPC. Stateless: cada request é independente.
+  if (req.method === "POST" && url.pathname === "/mcp") {
+    const creds = extractCredsFromHeaders(req);
+
+    if (!creds.baseUrl || !creds.token) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: "Credenciais ausentes",
+        details: "Forneça Authorization: Bearer TOKEN e X-CRM-Api-Url nos headers",
+      }));
+      return;
+    }
+
+    const credsFn = () => creds;
+    const mcpServer = new McpServer({ name: "clickmassa", version: "2.1.0" });
+    registerTools(mcpServer, credsFn);
+
+    // Stateless mode: sem sessionId, cada POST é auto-suficiente
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+    });
+
+    await mcpServer.connect(transport);
+
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", async () => {
+      try {
+        const parsed = body ? JSON.parse(body) : undefined;
+        await transport.handleRequest(req, res, parsed);
+      } catch (err) {
+        if (!res.headersSent) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "JSON inválido", detail: err.message }));
+        }
+      }
+    });
     return;
   }
 
